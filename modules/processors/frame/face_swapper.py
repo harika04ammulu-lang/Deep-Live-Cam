@@ -22,7 +22,10 @@ from collections import deque
 import time
 
 FACE_SWAPPER = None
+
 THREAD_LOCK = threading.Lock()
+_ema_kps = None
+_ema_alpha = 0.6
 NAME = "DLC.FACE-SWAPPER"
 
 # --- START: Added for Interpolation ---
@@ -380,6 +383,15 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     try:
         if not temp_frame.flags['C_CONTIGUOUS']:
             temp_frame = np.ascontiguousarray(temp_frame)
+
+        # EMA smoothing on target face landmarks
+        global _ema_kps
+        if hasattr(target_face, 'kps') and target_face.kps is not None:
+            if _ema_kps is None or _ema_kps.shape != target_face.kps.shape:
+                _ema_kps = target_face.kps.copy().astype(np.float32)
+            else:
+                _ema_kps = _ema_alpha * target_face.kps.astype(np.float32) + (1 - _ema_alpha) * _ema_kps
+            target_face.kps = _ema_kps.copy()
 
         # Use paste_back=False and our optimized paste-back
         if any("DmlExecutionProvider" in p for p in modules.globals.execution_providers):
