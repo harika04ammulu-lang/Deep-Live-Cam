@@ -1206,6 +1206,18 @@ def apply_mouth_area(
         else:
              resized_mouth_cutout = mouth_cutout
 
+        # Color match mouth cutout to swapped face skin tone
+        if resized_mouth_cutout is not None and resized_mouth_cutout.size > 0 and roi.size > 0:
+            try:
+                src_mean = resized_mouth_cutout.mean(axis=(0,1))
+                tgt_mean = roi.mean(axis=(0,1))
+                src_std = resized_mouth_cutout.std(axis=(0,1)) + 1e-6
+                tgt_std = roi.std(axis=(0,1)) + 1e-6
+                corrected = (resized_mouth_cutout.astype(np.float32) - src_mean) * (tgt_std / src_std) + tgt_mean
+                resized_mouth_cutout = np.clip(corrected, 0, 255).astype(np.uint8)
+            except Exception:
+                pass
+
         # If resize failed or original was invalid
         if resized_mouth_cutout is None or resized_mouth_cutout.size == 0:
             # print("Warning: Mouth cutout is invalid after resize attempt.")
@@ -1218,7 +1230,7 @@ def apply_mouth_area(
         cv2.fillPoly(polygon_mask_roi, [adjusted_polygon.astype(np.int32)], 255)
 
         # Feather the edges with Gaussian blur for smooth blending
-        feather_amount = max(1, min(30, min(box_width, box_height) // 8))
+        feather_amount = max(5, min(51, min(box_width, box_height) // 4))
         kernel_size = 2 * feather_amount + 1
         feathered_mask = cv2.GaussianBlur(polygon_mask_roi.astype(np.float32), (kernel_size, kernel_size), 0)
 
