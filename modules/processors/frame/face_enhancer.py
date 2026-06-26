@@ -281,7 +281,8 @@ _enh_live_cache: dict = {
     'align_size': 0,
     'frame_count': 0,
 }
-_ENH_INTERVAL = 2  # run inference every N frames, paste cached result otherwise
+_ENH_INTERVAL = 3  # run inference every N frames, paste cached result otherwise
+                   # (3 favours frame rate for live calls; lower = sharper but heavier)
 
 
 def enhance_face(temp_frame: Frame, detected_faces=None) -> Frame:

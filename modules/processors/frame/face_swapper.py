@@ -25,8 +25,23 @@ FACE_SWAPPER = None
 
 THREAD_LOCK = threading.Lock()
 _ema_kps = None
-_ema_alpha = 0.6
+# Adaptive EMA bounds: heavy smoothing when the face is still (suppresses
+# detector jitter), nearly raw landmarks during fast motion (no lip-sync lag).
+_ema_alpha_min = 0.75  # higher floor = snappier lips/expression (less lag), slight jitter when still
+_ema_alpha_max = 1.0
+_ema_motion_gain = 10.0  # how fast alpha ramps up with motion (relative to eye distance)
+_ema_last_time = 0.0
+_ema_reset_gap = 0.5  # seconds without a swap → treat next face as fresh (no smear on reacquisition)
 NAME = "DLC.FACE-SWAPPER"
+
+# Temporal smoothing for color-match statistics. Recomputing mean/std fresh
+# every frame makes the correction track transient content (teeth showing,
+# beard shadow shifting as the jaw moves) instead of actual lighting, which
+# reads as a flash/flicker near the mouth while talking.
+_face_color_ema = {'mean': None, 'ratio': None}
+_mouth_color_ema = {'shift': None}
+_eyes_color_ema = {'shift': None}
+_COLOR_EMA_ALPHA = 0.85  # higher = smoother/slower to react, less flicker
 
 # --- START: Added for Interpolation ---
 PREVIOUS_FRAME_RESULT = None # Stores the final processed frame from the previous step
@@ -176,10 +191,16 @@ def _get_soft_alpha(size: int) -> np.ndarray:
     the feather radius scales naturally with the affine transform.
     """
     if _paste_cache['alpha_size'] != size:
-        k_erode = max(size // 10, 3)
         k_blur = max(size // 20, 3)
-        mask = np.full((size, size), 255, dtype=np.uint8)
-        mask = cv2.erode(mask, np.ones((k_erode, k_erode), np.uint8), iterations=1)
+        # Elliptical, not square: a uniformly-eroded full-square mask still
+        # blends as a square (just softened at the edges), and any tone/
+        # lighting mismatch between the source photo and the live scene
+        # shows up as a visible rectangle over the face. An oval inscribed
+        # in the aligned crop follows the actual face shape instead.
+        mask = np.zeros((size, size), dtype=np.uint8)
+        center = (size // 2, size // 2)
+        axes = (int(size * 0.42), int(size * 0.48))
+        cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
         mask = cv2.GaussianBlur(mask, (2 * k_blur + 1, 2 * k_blur + 1), 0)
         _paste_cache['soft_alpha'] = mask  # uint8 [0, 255] — blended via cv2 SIMD ops
         _paste_cache['alpha_size'] = size
@@ -334,6 +355,45 @@ def _fast_paste_back(target_img: Frame, bgr_fake: np.ndarray, aimg: np.ndarray, 
 
     target_crop = target_img[y1p:y2p, x1p:x2p]
 
+    # Lighting match: shift the swapped face's per-channel mean toward the
+    # real underlying face so it sits in the scene's lighting instead of
+    # the source photo's. Mean-only over the masked face area, clamped and
+    # half-strength — whole-face stats are temporally stable so no flicker.
+    if getattr(modules.globals, "face_color_match", True):
+        face_px = alpha_crop > 128
+        if np.count_nonzero(face_px) > 256:
+            # Mean+std (LAB) match instead of mean-only: corrects contrast/tone
+            # drift between the source photo and the live scene's lighting, not
+            # just brightness. Ratio is clamped to avoid over-correcting from a
+            # handful of outlier pixels (specular highlights, teeth, etc.).
+            fake_lab = cv2.cvtColor(bgr_fake_crop, cv2.COLOR_BGR2LAB).astype(np.float32)
+            real_lab = cv2.cvtColor(target_crop, cv2.COLOR_BGR2LAB).astype(np.float32)
+            fake_mean = fake_lab[face_px].mean(axis=0)
+            fake_std = np.maximum(fake_lab[face_px].std(axis=0), 1e-3)
+            real_mean = real_lab[face_px].mean(axis=0)
+            real_std = np.maximum(real_lab[face_px].std(axis=0), 1e-3)
+            raw_diff = real_mean - fake_mean
+            raw_ratio = np.clip(real_std / fake_std, 0.7, 1.3)
+
+            # EMA-smooth the correction itself so it tracks ambient lighting,
+            # not frame-to-frame content changes (mouth open/closed, beard
+            # shadow shifting) — that's what caused the flashing near the lips.
+            if _face_color_ema['mean'] is None:
+                _face_color_ema['mean'] = raw_diff
+                _face_color_ema['ratio'] = raw_ratio
+            else:
+                a = _COLOR_EMA_ALPHA
+                _face_color_ema['mean'] = a * _face_color_ema['mean'] + (1 - a) * raw_diff
+                _face_color_ema['ratio'] = a * _face_color_ema['ratio'] + (1 - a) * raw_ratio
+            diff = _face_color_ema['mean']
+            ratio = _face_color_ema['ratio']
+
+            corrected_lab = (fake_lab - fake_mean) * ratio + fake_mean + diff
+            # Blend with the uncorrected face at 70% strength to keep
+            # frame-to-frame stability (full correction can flicker).
+            blended_lab = fake_lab * 0.3 + corrected_lab * 0.7
+            bgr_fake_crop = cv2.cvtColor(np.clip(blended_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+
     if _HAS_TORCH_CUDA:
         # Scale alpha to [0, 1] on device — cheaper to upload uint8 than float.
         mask_t = torch.from_numpy(alpha_crop).cuda().float().mul_(1.0 / 255.0).unsqueeze(2)
@@ -371,7 +431,8 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     opacity = getattr(modules.globals, "opacity", 1.0)
     opacity = max(0.0, min(1.0, opacity))
     mouth_mask_enabled = getattr(modules.globals, "mouth_mask", False)
-    needs_original = opacity < 1.0 or mouth_mask_enabled
+    eyes_mask_enabled = getattr(modules.globals, "eyes_mask", False)
+    needs_original = opacity < 1.0 or mouth_mask_enabled or eyes_mask_enabled
     if needs_original:
         original_frame = temp_frame.copy()
     else:
@@ -384,13 +445,29 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
         if not temp_frame.flags['C_CONTIGUOUS']:
             temp_frame = np.ascontiguousarray(temp_frame)
 
-        # EMA smoothing on target face landmarks
-        global _ema_kps
+        # Motion-adaptive EMA smoothing on target face landmarks.
+        # A fixed low alpha makes the swap trail behind real motion, which
+        # reads as bad lip sync; a fixed high alpha jitters when still.
+        # Scale alpha by per-frame landmark motion (normalized by eye
+        # distance so it is resolution/zoom independent).
+        global _ema_kps, _ema_last_time
         if hasattr(target_face, 'kps') and target_face.kps is not None:
-            if _ema_kps is None or _ema_kps.shape != target_face.kps.shape:
-                _ema_kps = target_face.kps.copy().astype(np.float32)
+            now = time.time()
+            if now - _ema_last_time > _ema_reset_gap:
+                _ema_kps = None  # face was lost — don't smear from the stale position
+                _face_color_ema['mean'] = None
+                _face_color_ema['ratio'] = None
+                _mouth_color_ema['shift'] = None
+                _eyes_color_ema['shift'] = None
+            _ema_last_time = now
+            new_kps = target_face.kps.astype(np.float32)
+            if _ema_kps is None or _ema_kps.shape != new_kps.shape:
+                _ema_kps = new_kps.copy()
             else:
-                _ema_kps = _ema_alpha * target_face.kps.astype(np.float32) + (1 - _ema_alpha) * _ema_kps
+                eye_dist = float(np.linalg.norm(new_kps[1] - new_kps[0])) + 1e-6
+                motion = float(np.linalg.norm(new_kps - _ema_kps, axis=1).mean()) / eye_dist
+                alpha = min(_ema_alpha_max, _ema_alpha_min + motion * _ema_motion_gain)
+                _ema_kps = alpha * new_kps + (1.0 - alpha) * _ema_kps
             target_face.kps = _ema_kps.copy()
 
         # Use paste_back=False and our optimized paste-back
@@ -446,7 +523,25 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
                 swapped_frame = draw_mouth_mask_visualization(
                     swapped_frame, target_face, mouth_mask_data
                 )
-        
+
+    if eyes_mask_enabled:
+        face_mask = create_face_mask(target_face, original_frame)
+
+        eyes_mask, eyes_cutout, eyes_box, eyes_polygon = (
+            create_eyes_mask(target_face, original_frame)
+        )
+
+        if eyes_cutout is not None and eyes_box != (0, 0, 0, 0):
+            swapped_frame = apply_eyes_area(
+                swapped_frame, eyes_cutout, eyes_box, face_mask, eyes_polygon
+            )
+
+            if getattr(modules.globals, "show_eyes_mask_box", False):
+                eyes_mask_data = (eyes_mask, eyes_cutout, eyes_box, eyes_polygon)
+                swapped_frame = draw_mouth_mask_visualization(
+                    swapped_frame, target_face, eyes_mask_data
+                )
+
     # --- Poisson Blending ---
     if getattr(modules.globals, "poisson_blend", False):
         face_mask = create_face_mask(target_face, temp_frame)
@@ -1206,14 +1301,31 @@ def apply_mouth_area(
         else:
              resized_mouth_cutout = mouth_cutout
 
-        # Color match mouth cutout to swapped face skin tone
+        # Gentle color match of the mouth cutout toward the swapped face tone.
+        # Mean-only, half strength: full mean+std matching flickers while
+        # talking because teeth/open-mouth pixels swing the per-frame
+        # statistics, recoloring lips frame to frame.
         if resized_mouth_cutout is not None and resized_mouth_cutout.size > 0 and roi.size > 0:
             try:
-                src_mean = resized_mouth_cutout.mean(axis=(0,1))
-                tgt_mean = roi.mean(axis=(0,1))
-                src_std = resized_mouth_cutout.std(axis=(0,1)) + 1e-6
-                tgt_std = roi.std(axis=(0,1)) + 1e-6
-                corrected = (resized_mouth_cutout.astype(np.float32) - src_mean) * (tgt_std / src_std) + tgt_mean
+                # Median instead of mean: teeth/specular highlights swing the
+                # mean a lot frame-to-frame (open/closed mouth) which made the
+                # old mean-based shift flicker; the median is far more stable.
+                src_med = np.median(resized_mouth_cutout.reshape(-1, 3), axis=0)
+                tgt_med = np.median(roi.reshape(-1, 3), axis=0)
+                raw_shift = np.clip(tgt_med - src_med, -25.0, 25.0) * 0.6
+
+                # EMA-smooth this too — the box itself grows/shrinks slightly
+                # as the mouth opens (more beard/jaw skin enters the ROI),
+                # which swung the median enough to look like a brightness
+                # flash. Smoothing makes it track lighting, not mouth shape.
+                if _mouth_color_ema['shift'] is None:
+                    _mouth_color_ema['shift'] = raw_shift
+                else:
+                    a = _COLOR_EMA_ALPHA
+                    _mouth_color_ema['shift'] = a * _mouth_color_ema['shift'] + (1 - a) * raw_shift
+                shift = _mouth_color_ema['shift']
+
+                corrected = resized_mouth_cutout.astype(np.float32) + shift
                 resized_mouth_cutout = np.clip(corrected, 0, 255).astype(np.uint8)
             except Exception:
                 pass
@@ -1229,8 +1341,11 @@ def apply_mouth_area(
         adjusted_polygon = mouth_polygon - [min_x, min_y]
         cv2.fillPoly(polygon_mask_roi, [adjusted_polygon.astype(np.int32)], 255)
 
-        # Feather the edges with Gaussian blur for smooth blending
-        feather_amount = max(5, min(51, min(box_width, box_height) // 4))
+        # Feather only a thin border so the interior stays 100% real mouth —
+        # a wide feather (the old //4) bleeds swapped-face skin into the
+        # middle of the lips, which is what made the mouth look pasted-on
+        # instead of like your actual lips moving.
+        feather_amount = max(3, min(18, min(box_width, box_height) // 10))
         kernel_size = 2 * feather_amount + 1
         feathered_mask = cv2.GaussianBlur(polygon_mask_roi.astype(np.float32), (kernel_size, kernel_size), 0)
 
@@ -1257,6 +1372,198 @@ def apply_mouth_area(
         # import traceback
         # traceback.print_exc()
         pass # Don't crash, just return the frame as is
+
+    return frame
+
+
+def create_eyes_mask(
+    face: Face, frame: Frame
+) -> (np.ndarray, np.ndarray, tuple, np.ndarray):
+    """Cuts out the real eye region (both eyes, one bbox) the same way
+    create_lower_mouth_mask() cuts out the mouth — so gaze direction and
+    blinking come from the live camera, not the static source photo.
+    """
+    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    eyes_cutout = None
+    eyes_polygon = None
+    eyes_box = (0, 0, 0, 0)
+
+    if face is None or not hasattr(face, 'landmark_2d_106'):
+        return mask, eyes_cutout, eyes_box, eyes_polygon
+
+    landmarks = face.landmark_2d_106
+    if landmarks is None or not isinstance(landmarks, np.ndarray) or landmarks.shape[0] < 106:
+        return mask, eyes_cutout, eyes_box, eyes_polygon
+
+    try:
+        # 106-point layout: right eye 33-42, left eye 87-96
+        right_eye = landmarks[33:43].astype(np.float32)
+        left_eye = landmarks[87:97].astype(np.float32)
+
+        if not np.all(np.isfinite(right_eye)) or not np.all(np.isfinite(left_eye)):
+            return mask, eyes_cutout, eyes_box, eyes_polygon
+
+        # Needs to be large enough that the boundary lands on plain skin,
+        # past the swapped face's own eyelid contour underneath — too tight
+        # a crop leaves the photo's eyelid line peeking out around the real
+        # eye, which reads as a "double eyelid" / double-layer artifact.
+        # Expansion is asymmetric: more upward (toward the brow, where the
+        # swapped lid crease is most visible) and a bit more downward
+        # (under-eye/cheek) than sideways, so the cut reaches into open skin
+        # on every side instead of just scaling the eye shape uniformly.
+        eyes_mask_size = getattr(modules.globals, "eyes_mask_size", 0.0)  # 0-100 slider
+        expansion_factor = 2.0 + (eyes_mask_size / 100.0) * 2.5
+
+        def expand(points):
+            center = np.mean(points, axis=0)
+            offsets = points - center
+            scale_x = expansion_factor
+            scale_y = np.where(offsets[:, 1] < 0, expansion_factor * 1.35, expansion_factor * 1.15)
+            out = points.copy()
+            out[:, 0] = center[0] + offsets[:, 0] * scale_x
+            out[:, 1] = center[1] + offsets[:, 1] * scale_y
+            return out
+
+        right_expanded = expand(right_eye)
+        left_expanded = expand(left_eye)
+
+        all_points = np.concatenate([right_expanded, left_expanded], axis=0)
+        if not np.all(np.isfinite(all_points)):
+            return mask, eyes_cutout, eyes_box, eyes_polygon
+
+        min_x, min_y = np.min(all_points, axis=0)
+        max_x, max_y = np.max(all_points, axis=0)
+
+        padding_ratio = 0.4
+        padding_x = (max_x - min_x) * padding_ratio
+        padding_y = (max_y - min_y) * padding_ratio
+
+        frame_h, frame_w = frame.shape[:2]
+        min_x = max(0, int(min_x - padding_x))
+        min_y = max(0, int(min_y - padding_y))
+        max_x = min(frame_w, int(max_x + padding_x))
+        max_y = min(frame_h, int(max_y + padding_y))
+
+        if max_x <= min_x or max_y <= min_y:
+            return mask, eyes_cutout, eyes_box, eyes_polygon
+
+        mask_roi = np.zeros((max_y - min_y, max_x - min_x), dtype=np.uint8)
+        right_rel = right_expanded - [min_x, min_y]
+        left_rel = left_expanded - [min_x, min_y]
+        cv2.fillPoly(mask_roi, [right_rel.astype(np.int32)], 255)
+        cv2.fillPoly(mask_roi, [left_rel.astype(np.int32)], 255)
+
+        blur_k_size = max(1, 11 // 2 * 2 + 1)
+        mask_roi = gpu_gaussian_blur(mask_roi, (blur_k_size, blur_k_size), 0)
+
+        mask[min_y:max_y, min_x:max_x] = mask_roi
+        eyes_cutout = frame[min_y:max_y, min_x:max_x].copy()
+        eyes_polygon = np.concatenate(
+            [right_expanded.astype(np.int32), left_expanded.astype(np.int32)], axis=0
+        )
+        eyes_box = (min_x, min_y, max_x, max_y)
+
+    except Exception as e:
+        print(f"Error in create_eyes_mask: {e}")
+
+    return mask, eyes_cutout, eyes_box, eyes_polygon
+
+
+def apply_eyes_area(
+    frame: np.ndarray,
+    eyes_cutout: np.ndarray,
+    eyes_box: tuple,
+    face_mask: np.ndarray,
+    eyes_polygon: np.ndarray,
+) -> np.ndarray:
+    """Pastes the real eyes cutout back onto the swapped face — mirrors
+    apply_mouth_area()'s approach (thin feather, mostly-original interior).
+    """
+    if (frame is None or eyes_cutout is None or eyes_box is None or
+            face_mask is None or eyes_polygon is None):
+        return frame
+    if eyes_cutout.size == 0 or face_mask.size == 0 or len(eyes_polygon) < 3:
+        return frame
+
+    try:
+        min_x, min_y, max_x, max_y = map(int, eyes_box)
+        box_width = max_x - min_x
+        box_height = max_y - min_y
+        if box_width <= 0 or box_height <= 0:
+            return frame
+
+        frame_h, frame_w = frame.shape[:2]
+        min_y, max_y = max(0, min_y), min(frame_h, max_y)
+        min_x, max_x = max(0, min_x), min(frame_w, max_x)
+        box_width = max_x - min_x
+        box_height = max_y - min_y
+        if box_width <= 0 or box_height <= 0:
+            return frame
+
+        roi = frame[min_y:max_y, min_x:max_x]
+        if roi.size == 0:
+            return frame
+
+        if roi.shape[:2] != eyes_cutout.shape[:2]:
+            if eyes_cutout.shape[0] > 0 and eyes_cutout.shape[1] > 0:
+                resized_cutout = gpu_resize(eyes_cutout, (box_width, box_height), interpolation=cv2.INTER_LINEAR)
+            else:
+                return frame
+        else:
+            resized_cutout = eyes_cutout
+
+        # Same EMA-smoothed median color match used for the mouth — keeps
+        # the eye skin tone stable instead of flickering with blinks.
+        if resized_cutout is not None and resized_cutout.size > 0 and roi.size > 0:
+            try:
+                src_med = np.median(resized_cutout.reshape(-1, 3), axis=0)
+                tgt_med = np.median(roi.reshape(-1, 3), axis=0)
+                raw_shift = np.clip(tgt_med - src_med, -25.0, 25.0) * 0.6
+
+                if _eyes_color_ema['shift'] is None:
+                    _eyes_color_ema['shift'] = raw_shift
+                else:
+                    a = _COLOR_EMA_ALPHA
+                    _eyes_color_ema['shift'] = a * _eyes_color_ema['shift'] + (1 - a) * raw_shift
+                shift = _eyes_color_ema['shift']
+
+                corrected = resized_cutout.astype(np.float32) + shift
+                resized_cutout = np.clip(corrected, 0, 255).astype(np.uint8)
+            except Exception:
+                pass
+
+        if resized_cutout is None or resized_cutout.size == 0:
+            return frame
+
+        # eyes_polygon is two separate eye contours concatenated — fill them
+        # as two polygons, not one. Filling them as a single polygon draws a
+        # spurious connecting band across the nose bridge between the last
+        # point of one eye and the first point of the other.
+        polygon_mask_roi = np.zeros(roi.shape[:2], dtype=np.uint8)
+        adjusted_polygon = eyes_polygon - [min_x, min_y]
+        mid = len(adjusted_polygon) // 2
+        cv2.fillPoly(polygon_mask_roi, [adjusted_polygon[:mid].astype(np.int32)], 255)
+        cv2.fillPoly(polygon_mask_roi, [adjusted_polygon[mid:].astype(np.int32)], 255)
+
+        feather_amount = max(8, min(40, min(box_width, box_height) // 5))
+        kernel_size = 2 * feather_amount + 1
+        feathered_mask = cv2.GaussianBlur(polygon_mask_roi.astype(np.float32), (kernel_size, kernel_size), 0)
+
+        max_val = feathered_mask.max()
+        if max_val > 1e-6:
+            feathered_mask = feathered_mask / max_val
+        else:
+            feathered_mask.fill(0.0)
+
+        if len(frame.shape) == 3 and frame.shape[2] == 3:
+            mask_3ch = feathered_mask[:, :, np.newaxis].astype(np.float32)
+            inv_mask = 1.0 - mask_3ch
+            blended_roi = (resized_cutout.astype(np.float32) * mask_3ch +
+                           roi.astype(np.float32) * inv_mask)
+            frame[min_y:max_y, min_x:max_x] = np.clip(blended_roi, 0, 255).astype(np.uint8)
+
+    except Exception as e:
+        print(f"Error applying eyes area: {e}")
 
     return frame
 

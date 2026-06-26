@@ -96,6 +96,8 @@ def _needs_landmark() -> bool:
     """
     if getattr(modules.globals, "mouth_mask", False):
         return True
+    if getattr(modules.globals, "eyes_mask", False):
+        return True
     processors = getattr(modules.globals, "frame_processors", [])
     return any(p in processors for p in
                ("face_enhancer", "face_enhancer_gpen256", "face_enhancer_gpen512"))
@@ -161,10 +163,12 @@ def get_many_faces(frame: Frame) -> Any:
         return None
 
 def detect_one_face_fast(frame: Frame) -> Any:
-    """Detection-only — skips landmark and recognition models.
+    """Detection-only (+landmark when mouth masking needs it) — skips recognition.
 
     Returns a Face with bbox, kps, det_score (enough for face swap).
-    ~10ms vs ~16ms for full get_one_face() at 1080p.
+    Mouth masking requires landmark_2d_106, so that model runs too whenever
+    mouth_mask is enabled — otherwise create_lower_mouth_mask() silently
+    no-ops because the attribute is missing in live mode.
     """
     from insightface.app.common import Face
     fa = get_face_analyser()
@@ -172,18 +176,28 @@ def detect_one_face_fast(frame: Frame) -> Any:
     if bboxes.shape[0] == 0:
         return None
     idx = int(bboxes[:, 0].argmin())
-    return Face(bbox=bboxes[idx, :4], kps=kpss[idx], det_score=bboxes[idx, 4])
+    face = Face(bbox=bboxes[idx, :4], kps=kpss[idx], det_score=bboxes[idx, 4])
+    if _needs_landmark():
+        lmk_model = fa.models.get("landmark_2d_106")
+        if lmk_model is not None:
+            lmk_model.get(frame, face)
+    return face
 
 
 def detect_many_faces_fast(frame: Frame) -> Any:
-    """Detection-only multi-face — skips landmark and recognition."""
+    """Detection-only (+landmark when mouth masking needs it) — skips recognition."""
     from insightface.app.common import Face
     fa = get_face_analyser()
     bboxes, kpss = fa.det_model.detect(frame, max_num=0, metric='default')
     if bboxes.shape[0] == 0:
         return None
-    return [Face(bbox=bboxes[i, :4], kps=kpss[i], det_score=bboxes[i, 4])
-            for i in range(bboxes.shape[0])]
+    lmk_model = fa.models.get("landmark_2d_106") if _needs_landmark() else None
+    faces = [Face(bbox=bboxes[i, :4], kps=kpss[i], det_score=bboxes[i, 4])
+             for i in range(bboxes.shape[0])]
+    if lmk_model is not None:
+        for face in faces:
+            lmk_model.get(frame, face)
+    return faces
 
 
 def has_valid_map() -> bool:

@@ -140,6 +140,7 @@ def save_switch_states():
         "mouth_mask": modules.globals.mouth_mask,
         "show_mouth_mask_box": modules.globals.show_mouth_mask_box,
         "mouth_mask_size": modules.globals.mouth_mask_size,
+        "eyes_mask_size": modules.globals.eyes_mask_size,
     }
     with open("switch_states.json", "w") as f:
         json.dump(switch_states, f)
@@ -161,10 +162,13 @@ def load_switch_states():
         modules.globals.live_resizable = switch_states.get("live_resizable", False)
         modules.globals.fp_ui = switch_states.get("fp_ui", {"face_enhancer": False})
         modules.globals.show_fps = switch_states.get("show_fps", False)
-        modules.globals.mouth_mask_size = switch_states.get("mouth_mask_size", 0.0)
+        modules.globals.mouth_mask_size = switch_states.get("mouth_mask_size", 35.0)
         # mouth_mask is driven by the slider: on if size > 0, off if 0
         modules.globals.mouth_mask = modules.globals.mouth_mask_size > 0
         modules.globals.show_mouth_mask_box = False  # always start hidden
+        modules.globals.eyes_mask_size = switch_states.get("eyes_mask_size", 60.0)
+        modules.globals.eyes_mask = modules.globals.eyes_mask_size > 0
+        modules.globals.show_eyes_mask_box = False  # always start hidden
     except FileNotFoundError:
         # If the file doesn't exist, use default values
         pass
@@ -344,24 +348,24 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
     start_button = ctk.CTkButton(
         root, text=_("Start"), cursor="hand2", command=lambda: analyze_target(start, root)
     )
-    start_button.place(relx=0.15, rely=0.78, relwidth=0.2, relheight=0.04)
+    start_button.place(relx=0.15, rely=0.82, relwidth=0.2, relheight=0.04)
     ToolTip(start_button, _("Begin processing the target image/video with selected face"))
 
     stop_button = ctk.CTkButton(
         root, text=_("Destroy"), cursor="hand2", command=lambda: destroy()
     )
-    stop_button.place(relx=0.4, rely=0.78, relwidth=0.2, relheight=0.04)
+    stop_button.place(relx=0.4, rely=0.82, relwidth=0.2, relheight=0.04)
     ToolTip(stop_button, _("Stop processing and close the application"))
 
     preview_button = ctk.CTkButton(
         root, text=_("Preview"), cursor="hand2", command=lambda: toggle_preview()
     )
-    preview_button.place(relx=0.65, rely=0.78, relwidth=0.2, relheight=0.04)
+    preview_button.place(relx=0.65, rely=0.82, relwidth=0.2, relheight=0.04)
     ToolTip(preview_button, _("Show/hide a preview of the processed output"))
 
     # --- Camera Selection ---
     camera_label = ctk.CTkLabel(root, text=_("Select Camera:"))
-    camera_label.place(relx=0.1, rely=0.83, relwidth=0.2, relheight=0.03)
+    camera_label.place(relx=0.1, rely=0.87, relwidth=0.2, relheight=0.03)
 
     available_cameras = get_available_cameras()
     camera_indices, camera_names = available_cameras
@@ -380,7 +384,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
             root, variable=camera_variable, values=camera_names
         )
 
-    camera_optionmenu.place(relx=0.35, rely=0.83, relwidth=0.25, relheight=0.03)
+    camera_optionmenu.place(relx=0.35, rely=0.87, relwidth=0.25, relheight=0.03)
     ToolTip(camera_optionmenu, _("Select which camera to use for live mode"))
 
     live_button = ctk.CTkButton(
@@ -401,7 +405,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
             else "disabled"
         ),
     )
-    live_button.place(relx=0.65, rely=0.83, relwidth=0.2, relheight=0.03)
+    live_button.place(relx=0.65, rely=0.87, relwidth=0.2, relheight=0.03)
     ToolTip(live_button, _("Start real-time face swap using webcam"))
     # --- End Camera Selection ---
 
@@ -488,7 +492,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
     ToolTip(transparency_slider, _("Blend between original and swapped face (0% = original, 100% = fully swapped)"))
 
     # 3) Sharpness label & slider
-    sharpness_var = ctk.DoubleVar(value=0.0)  # start at 0.0
+    sharpness_var = ctk.DoubleVar(value=modules.globals.sharpness)
     def on_sharpness_change(value: float):
         modules.globals.sharpness = float(value)
         update_status(f"Sharpness set to {value:.1f}")
@@ -559,15 +563,56 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
     mouth_mask_size_slider.bind("<ButtonRelease-1>", on_mouth_mask_slider_release)
     ToolTip(mouth_mask_size_slider, _("0 = use swapped mouth, 100 = expose original mouth to chin area"))
 
+    # 5) Eyes Mask Size slider
+    eyes_mask_size_var = ctk.DoubleVar(value=modules.globals.eyes_mask_size)
+
+    def on_eyes_mask_size_change(value: float):
+        val = float(value)
+        modules.globals.eyes_mask_size = val
+        if val > 0:
+            modules.globals.eyes_mask = True
+        else:
+            modules.globals.eyes_mask = False
+            modules.globals.show_eyes_mask_box = False
+
+    def on_eyes_mask_slider_release(event):
+        modules.globals.show_eyes_mask_box = False
+
+    def on_eyes_mask_slider_press(event):
+        if modules.globals.eyes_mask_size > 0:
+            modules.globals.show_eyes_mask_box = True
+
+    eyes_mask_size_label = ctk.CTkLabel(root, text="Eyes Mask:")
+    eyes_mask_size_label.place(relx=0.15, rely=0.75, relwidth=0.2, relheight=0.03)
+
+    eyes_mask_size_slider = ctk.CTkSlider(
+        root,
+        from_=0.0,
+        to=100.0,
+        variable=eyes_mask_size_var,
+        command=on_eyes_mask_size_change,
+        fg_color="#E0E0E0",
+        progress_color="#007BFF",
+        button_color="#FFFFFF",
+        button_hover_color="#CCCCCC",
+        height=5,
+        border_width=1,
+        corner_radius=3,
+    )
+    eyes_mask_size_slider.place(relx=0.35, rely=0.76, relwidth=0.5, relheight=0.02)
+    eyes_mask_size_slider.bind("<ButtonPress-1>", on_eyes_mask_slider_press)
+    eyes_mask_size_slider.bind("<ButtonRelease-1>", on_eyes_mask_slider_release)
+    ToolTip(eyes_mask_size_slider, _("0 = use swapped eyes, 100 = expose original eyes more widely"))
+
     # Status and link at the bottom
     global status_label
     status_label = ctk.CTkLabel(root, text=None, justify="center")
-    status_label.place(relx=0.1, rely=0.75, relwidth=0.8)
+    status_label.place(relx=0.1, rely=0.79, relwidth=0.8)
 
     donate_label = ctk.CTkLabel(
         root, text="Deep Live Cam", justify="center", cursor="hand2"
     )
-    donate_label.place(relx=0.1, rely=0.87, relwidth=0.8)
+    donate_label.place(relx=0.1, rely=0.91, relwidth=0.8)
     donate_label.configure(
         text_color=ctk.ThemeManager.theme.get("URL").get("text_color")
     )
@@ -1077,14 +1122,29 @@ def get_available_cameras():
         return camera_indices, camera_names
 
 
-def _capture_thread_func(cap, capture_queue, stop_event):
+def _capture_thread_func(cap, capture_queue, stop_event, camera_lost_event=None):
     """Capture thread: reads frames from camera and puts them into the queue.
-    Drops frames when the queue is full to avoid backpressure on the camera."""
+    Drops frames when the queue is full to avoid backpressure on the camera.
+
+    Tolerates brief read failures (USB hiccups, driver autofocus stalls)
+    instead of tearing down the whole session on the first bad frame — only
+    gives up after a sustained run of failures, and flags camera_lost_event
+    so the UI can tell "camera actually gone" apart from a normal close.
+    """
+    consecutive_failures = 0
+    MAX_CONSECUTIVE_FAILURES = 60  # ~1-2s of retries depending on fps
     while not stop_event.is_set():
         ret, frame = cap.read()
         if not ret:
-            stop_event.set()
-            break
+            consecutive_failures += 1
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                if camera_lost_event is not None:
+                    camera_lost_event.set()
+                stop_event.set()
+                break
+            time.sleep(0.02)
+            continue
+        consecutive_failures = 0
         try:
             capture_queue.put_nowait(frame)
         except queue.Full:
@@ -1119,9 +1179,16 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event,
     det_count = 0
     cached_target_face = None
     cached_many_faces = None
+    # Fail-safe state: never let the raw (unswapped) face reach the output
+    # on a transient detection miss. Reuse the last good face position for
+    # a short grace window; past that, freeze the last swapped frame.
+    last_good_face = None
+    last_face_time = 0.0
+    last_swapped_frame = None
+    FACE_GRACE_SEC = 1.0
     # Detect every N frames ≈ 80ms.  At 60fps → every 5 frames (83ms),
     # at 30fps → every 3 frames (100ms), at 15fps → every frame.
-    det_interval = max(1, round(camera_fps * 0.08))
+    det_interval = max(1, round(camera_fps * 0.05))
 
     while not stop_event.is_set():
         try:
@@ -1147,8 +1214,19 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event,
                     cached_target_face = None
                     cached_many_faces = detect_many_faces_fast(temp_frame)
                 else:
-                    cached_target_face = detect_one_face_fast(temp_frame)
+                    detected = detect_one_face_fast(temp_frame)
                     cached_many_faces = None
+                    if detected is not None:
+                        cached_target_face = detected
+                        last_good_face = detected
+                        last_face_time = time.time()
+                    elif (last_good_face is not None
+                          and time.time() - last_face_time < FACE_GRACE_SEC):
+                        # Transient miss — keep swapping at the last known
+                        # position rather than leaking the raw face.
+                        cached_target_face = last_good_face
+                    else:
+                        cached_target_face = None
 
             # Build face list for enhancers from cached detection
             _cached_faces = None
@@ -1184,6 +1262,14 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event,
                         temp_frame = frame_processor.swap_face(source_image, cached_target_face, temp_frame)
                         if hasattr(cached_target_face, 'bbox') and cached_target_face.bbox is not None:
                             swapped_bboxes.append(cached_target_face.bbox.astype(int))
+                        last_swapped_frame = temp_frame
+                    elif (getattr(modules.globals, "live_fail_safe", True)
+                          and not modules.globals.many_faces
+                          and last_swapped_frame is not None
+                          and last_swapped_frame.shape == temp_frame.shape):
+                        # Face lost beyond the grace window — hold the last
+                        # swapped frame instead of exposing the raw face.
+                        temp_frame = last_swapped_frame
                     # Apply post-processing (sharpening, interpolation)
                     temp_frame = frame_processor.apply_post_processing(temp_frame, swapped_bboxes)
                 else:
@@ -1239,7 +1325,15 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event,
 def create_webcam_preview(camera_index: int):
     global preview_label, PREVIEW
 
-    cap = VideoCapturer(camera_index)
+    try:
+        cap = VideoCapturer(camera_index)
+    except ValueError as e:
+        # Camera list was stale (device unplugged between enumeration and
+        # click) — show a clean error instead of crashing the button's
+        # Tk callback, which would otherwise freeze the whole event loop.
+        update_status(f"Camera unavailable: {e}")
+        return
+
     if not cap.start(1920, 1080, 60):
         update_status("Failed to start camera")
         return
@@ -1255,11 +1349,12 @@ def create_webcam_preview(camera_index: int):
     capture_queue = queue.Queue(maxsize=2)
     processed_queue = queue.Queue(maxsize=2)
     stop_event = threading.Event()
+    camera_lost_event = threading.Event()
 
     # Start capture thread
     cap_thread = threading.Thread(
         target=_capture_thread_func,
-        args=(cap, capture_queue, stop_event),
+        args=(cap, capture_queue, stop_event, camera_lost_event),
         daemon=True,
     )
     cap_thread.start()
@@ -1287,6 +1382,10 @@ def create_webcam_preview(camera_index: int):
     # Non-blocking display loop using ROOT.after() — avoids blocking the
     # Tk event loop which could cause UI freezes or re-entrancy issues.
     def _display_next_frame():
+        if camera_lost_event.is_set():
+            update_status("Camera disconnected — preview closed.")
+            _cleanup()
+            return
         if stop_event.is_set() or PREVIEW.state() == "withdrawn":
             _cleanup()
             return

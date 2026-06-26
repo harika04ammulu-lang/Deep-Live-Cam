@@ -50,20 +50,31 @@ headless: bool | None = None         # Run without UI?
 log_level: str = "error"             # Logging level (e.g., 'debug', 'info', 'warning', 'error')
 
 # Face Processor UI Toggles (Example)
+# Enhancer OFF by default: GFPGAN is too heavy for smooth real-time on this
+# hardware and adds lip lag. Clarity instead comes from the lightweight
+# sharpening pass. Enable GFPGAN from the UI dropdown only for recording.
 fp_ui: Dict[str, bool] = {"face_enhancer": False, "face_enhancer_gpen256": False, "face_enhancer_gpen512": False}
 
 # Face Swapper Specific Options
 face_swapper_enabled: bool = True # General toggle for the swapper processor
 opacity: float = 1.0              # Blend factor for the swapped face (0.0-1.0)
-sharpness: float = 0.0            # Sharpness enhancement for swapped face (0.0-1.0+)
+sharpness: float = 0.25           # Sharpness enhancement for swapped face (0.0-1.0+) — counters 128px model softness
+face_color_match: bool = True     # Shift swapped face tone toward live scene lighting
+live_fail_safe: bool = True       # On face-detection loss in live mode, freeze last swapped frame instead of showing the real face
 
 # Mouth Mask Options
-mouth_mask: bool = False           # Enable mouth area masking/pasting
+mouth_mask: bool = True            # Enable mouth area masking/pasting (real mouth pasted back = natural lip sync)
 show_mouth_mask_box: bool = False  # Visualize the mouth mask area (for debugging)
 mask_feather_ratio: int = 12       # Denominator for feathering calculation (higher = smaller feather)
 mask_down_size: float = 0.1        # Expansion factor for lower lip mask (relative)
 mask_size: float = 1.0             # Expansion factor for upper lip mask (relative)
-mouth_mask_size: float = 0.0       # Mouth mask size (0-100; 0=off, 100=mouth to chin)
+mouth_mask_size: float = 35.0      # Mouth mask size (0-100; 0=off, 100=mouth to chin)
+
+# Eyes Mask Options (same idea as mouth mask: paste the real eyes back onto
+# the swapped face so gaze direction/blinking matches you exactly)
+eyes_mask: bool = True             # Enable eyes area masking/pasting
+show_eyes_mask_box: bool = False   # Visualize the eyes mask area (for debugging)
+eyes_mask_size: float = 60.0       # Eyes mask size (0-100; 0=off, 100=largest crop)
 
 # --- START: Added for Frame Interpolation ---
 enable_interpolation: bool = True # Toggle temporal smoothing
