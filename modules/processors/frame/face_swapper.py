@@ -360,12 +360,12 @@ def _fast_paste_back(target_img: Frame, bgr_fake: np.ndarray, aimg: np.ndarray, 
     # the source photo's. Mean-only over the masked face area, clamped and
     # half-strength — whole-face stats are temporally stable so no flicker.
     if getattr(modules.globals, "face_color_match", True):
-        face_px = alpha_crop > 128
-        if np.count_nonzero(face_px) > 256:
-            # Mean+std (LAB) match instead of mean-only: corrects contrast/tone
-            # drift between the source photo and the live scene's lighting, not
-            # just brightness. Ratio is clamped to avoid over-correcting from a
-            # handful of outlier pixels (specular highlights, teeth, etc.).
+        # Use only the high-confidence center of the face for statistics.
+        # alpha > 128 captures the ellipse edge which contains hair, ear edges,
+        # and background bleed — those dark pixels skew the LAB mean and produce
+        # a wrong skin-tone correction. alpha > 180 restricts to the core face.
+        face_px = alpha_crop > 180
+        if np.count_nonzero(face_px) > 128:
             fake_lab = cv2.cvtColor(bgr_fake_crop, cv2.COLOR_BGR2LAB).astype(np.float32)
             real_lab = cv2.cvtColor(target_crop, cv2.COLOR_BGR2LAB).astype(np.float32)
             fake_mean = fake_lab[face_px].mean(axis=0)
@@ -375,9 +375,8 @@ def _fast_paste_back(target_img: Frame, bgr_fake: np.ndarray, aimg: np.ndarray, 
             raw_diff = real_mean - fake_mean
             raw_ratio = np.clip(real_std / fake_std, 0.7, 1.3)
 
-            # EMA-smooth the correction itself so it tracks ambient lighting,
-            # not frame-to-frame content changes (mouth open/closed, beard
-            # shadow shifting) — that's what caused the flashing near the lips.
+            # EMA-smooth the correction so it tracks ambient lighting, not
+            # frame-to-frame content (mouth open/closed, beard shifting).
             if _face_color_ema['mean'] is None:
                 _face_color_ema['mean'] = raw_diff
                 _face_color_ema['ratio'] = raw_ratio
@@ -389,9 +388,10 @@ def _fast_paste_back(target_img: Frame, bgr_fake: np.ndarray, aimg: np.ndarray, 
             ratio = _face_color_ema['ratio']
 
             corrected_lab = (fake_lab - fake_mean) * ratio + fake_mean + diff
-            # Blend with the uncorrected face at 70% strength to keep
-            # frame-to-frame stability (full correction can flicker).
-            blended_lab = fake_lab * 0.3 + corrected_lab * 0.7
+            # 80% correction: passport photos under studio flash sit in very
+            # different lighting than a live scene. The 30% residual from the
+            # old 70% was visible as a shadow ring at the face boundary.
+            blended_lab = fake_lab * 0.2 + corrected_lab * 0.8
             bgr_fake_crop = cv2.cvtColor(np.clip(blended_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
 
     if _HAS_TORCH_CUDA:

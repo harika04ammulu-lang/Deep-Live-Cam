@@ -1185,10 +1185,12 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event,
     last_good_face = None
     last_face_time = 0.0
     last_swapped_frame = None
-    FACE_GRACE_SEC = 1.0
-    # Detect every N frames ≈ 80ms.  At 60fps → every 5 frames (83ms),
-    # at 30fps → every 3 frames (100ms), at 15fps → every frame.
-    det_interval = max(1, round(camera_fps * 0.05))
+    FACE_GRACE_SEC = 1.0    # reuse last detected position on a transient miss
+    FREEZE_TIMEOUT_SEC = 2.5  # cap on how long the frozen frame is held
+    # Detect every N frames ≈ 100ms.  At 60fps → every 6 frames, at 30fps
+    # → every 3 frames, at 15fps → every 2 frames.  Formula was 0.05 which
+    # gave every 2 frames at 30fps (too frequent — detection competed with swap).
+    det_interval = max(2, round(camera_fps * 0.1))
 
     while not stop_event.is_set():
         try:
@@ -1205,6 +1207,16 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event,
             if modules.globals.source_path and modules.globals.source_path != last_source_path:
                 last_source_path = modules.globals.source_path
                 source_image = get_one_face(cv2.imread(modules.globals.source_path))
+                # New source photo → wipe the colour EMAs so the correction
+                # starts fresh for the new face's skin tone instead of drifting
+                # in from the previous photo (shows as a colour flash/wrong tone).
+                from modules.processors.frame.face_swapper import (
+                    _face_color_ema, _mouth_color_ema, _eyes_color_ema
+                )
+                _face_color_ema['mean'] = None
+                _face_color_ema['ratio'] = None
+                _mouth_color_ema['shift'] = None
+                _eyes_color_ema['shift'] = None
 
             # Run detection every det_interval frames (~80ms).
             # Use fast detection (det-only, no landmark/recognition) for live mode.
@@ -1266,9 +1278,11 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event,
                     elif (getattr(modules.globals, "live_fail_safe", True)
                           and not modules.globals.many_faces
                           and last_swapped_frame is not None
-                          and last_swapped_frame.shape == temp_frame.shape):
+                          and last_swapped_frame.shape == temp_frame.shape
+                          and time.time() - last_face_time < FREEZE_TIMEOUT_SEC):
                         # Face lost beyond the grace window — hold the last
-                        # swapped frame instead of exposing the raw face.
+                        # swapped frame for up to FREEZE_TIMEOUT_SEC, then
+                        # release to live so the preview doesn't freeze forever.
                         temp_frame = last_swapped_frame
                     # Apply post-processing (sharpening, interpolation)
                     temp_frame = frame_processor.apply_post_processing(temp_frame, swapped_bboxes)
