@@ -1254,12 +1254,10 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event,
                             None, temp_frame, detected_faces=_cached_faces)
                 elif frame_processor.NAME == "DLC.FACE-ENHANCER-GPEN256":
                     if modules.globals.fp_ui.get("face_enhancer_gpen256", False):
-                        temp_frame = frame_processor.process_frame(
-                            None, temp_frame, detected_faces=_cached_faces)
+                        temp_frame = frame_processor.process_frame_v2(temp_frame)
                 elif frame_processor.NAME == "DLC.FACE-ENHANCER-GPEN512":
                     if modules.globals.fp_ui.get("face_enhancer_gpen512", False):
-                        temp_frame = frame_processor.process_frame(
-                            None, temp_frame, detected_faces=_cached_faces)
+                        temp_frame = frame_processor.process_frame_v2(temp_frame)
                 elif frame_processor.NAME == "DLC.FACE-SWAPPER":
                     # Use cached face positions from detection thread
                     swapped_bboxes = []
