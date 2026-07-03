@@ -32,6 +32,14 @@ _ema_alpha_max = 1.0
 _ema_motion_gain = 10.0  # how fast alpha ramps up with motion (relative to eye distance)
 _ema_last_time = 0.0
 _ema_reset_gap = 0.5  # seconds without a swap → treat next face as fresh (no smear on reacquisition)
+
+# EMA for 106-point landmarks (mouth/eye mask boundaries).
+# Without this the mask polygon snaps to a new position every det_interval
+# frames, which reads as flickering/disturbance at the lip edge during speech.
+# alpha=0.70: 70% weight on new detection — fast enough to follow lip movement,
+# smooth enough to hide the 3-frame detection gap.
+_ema_lmk106 = None
+_LMK106_EMA_ALPHA = 0.70
 NAME = "DLC.FACE-SWAPPER"
 
 # Temporal smoothing for color-match statistics. Recomputing mean/std fresh
@@ -450,11 +458,12 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
         # reads as bad lip sync; a fixed high alpha jitters when still.
         # Scale alpha by per-frame landmark motion (normalized by eye
         # distance so it is resolution/zoom independent).
-        global _ema_kps, _ema_last_time
+        global _ema_kps, _ema_last_time, _ema_lmk106
         if hasattr(target_face, 'kps') and target_face.kps is not None:
             now = time.time()
             if now - _ema_last_time > _ema_reset_gap:
                 _ema_kps = None  # face was lost — don't smear from the stale position
+                _ema_lmk106 = None
                 _face_color_ema['mean'] = None
                 _face_color_ema['ratio'] = None
                 _mouth_color_ema['shift'] = None
@@ -499,7 +508,22 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
         return original_frame
 
     # --- Post-swap Processing (Masking, Opacity, etc.) ---
-    # Now, work with the guaranteed uint8 'swapped_frame'
+
+    # Smooth the 106-pt landmarks used for mouth/eye mask placement.
+    # Detection runs every det_interval frames so without smoothing the mask
+    # polygon snaps to a new position on each detection frame — visible as
+    # flickering/disturbance at the lip edge during speech on a video call.
+    # EMA at 0.70 alpha: fast enough to track lip movement, smooth enough to
+    # hide the detection gap. No feedback-loop risk: EMA is stable when fed
+    # a constant value (the cached landmark between detections stays put).
+    lmk = getattr(target_face, 'landmark_2d_106', None)
+    if lmk is not None and isinstance(lmk, np.ndarray) and lmk.shape[0] == 106:
+        lmk_f = lmk.astype(np.float32)
+        if _ema_lmk106 is None or _ema_lmk106.shape != lmk_f.shape:
+            _ema_lmk106 = lmk_f.copy()
+        else:
+            _ema_lmk106 = _LMK106_EMA_ALPHA * lmk_f + (1.0 - _LMK106_EMA_ALPHA) * _ema_lmk106
+        target_face.landmark_2d_106 = _ema_lmk106
 
     if mouth_mask_enabled: # Check if mouth_mask is enabled
         # Create a mask for the target face
