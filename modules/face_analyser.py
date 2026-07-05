@@ -184,6 +184,34 @@ def detect_one_face_fast(frame: Frame) -> Any:
     return face
 
 
+def refresh_landmarks(frame: Frame, face: Any) -> None:
+    """Re-run only the 106-point landmark model on the current frame.
+
+    Full face detection (640x640, ~20ms) is throttled to every few frames,
+    but the landmark model is tiny (192x192, ~1-2ms) — cheap enough to run
+    every frame using the cached bbox as the crop region. This keeps the
+    mouth/eye mask polygons locked to the *current* lip position instead of
+    where the lips were at the last detection frame, which is what caused
+    visible disturbance around the mouth while speaking.
+
+    Mutates face.landmark_2d_106 in place. Safe no-op on any failure.
+    """
+    if face is None or getattr(face, "bbox", None) is None:
+        return
+    try:
+        fa = get_face_analyser()
+        lmk_model = fa.models.get("landmark_2d_106")
+        if lmk_model is None:
+            return
+        if _is_dml():
+            with modules.globals.dml_lock:
+                lmk_model.get(frame, face)
+        else:
+            lmk_model.get(frame, face)
+    except Exception:
+        pass  # keep the previous landmarks — never crash the live loop
+
+
 def detect_many_faces_fast(frame: Frame) -> Any:
     """Detection-only (+landmark when mouth masking needs it) — skips recognition."""
     from insightface.app.common import Face

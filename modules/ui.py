@@ -19,6 +19,7 @@ from modules.face_analyser import (
     get_many_faces,
     detect_one_face_fast,
     detect_many_faces_fast,
+    refresh_landmarks,
     get_unique_faces_from_target_image,
     get_unique_faces_from_target_video,
     add_blank_map,
@@ -1239,6 +1240,16 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event,
                         cached_target_face = last_good_face
                     else:
                         cached_target_face = None
+            elif (cached_target_face is not None
+                  and (modules.globals.mouth_mask or modules.globals.eyes_mask)):
+                # Between detection frames: refresh only the 106-pt landmarks
+                # on the CURRENT frame (tiny 192x192 model, ~1-2ms). The mouth
+                # cutout content is always taken from the current frame, so if
+                # the polygon position is stale by up to det_interval frames
+                # the cutout grabs a misaligned patch — visible as flicker/
+                # disturbance around the lips while speaking. This keeps the
+                # lip polygon tracking at full frame rate.
+                refresh_landmarks(temp_frame, cached_target_face)
 
             # Build face list for enhancers from cached detection
             _cached_faces = None
