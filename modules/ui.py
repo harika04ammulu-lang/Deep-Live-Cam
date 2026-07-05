@@ -799,7 +799,11 @@ def create_preview(parent: ctk.CTkToplevel) -> ctk.CTkToplevel:
 
 
 def update_status(text: str) -> None:
-    status_label.configure(text=_(text))
+    # Guard for headless use (tests/diagnostics import processors without a GUI)
+    if status_label is None or ROOT is None:
+        print(f"[status] {text}")
+        return
+    status_label.configure(text=_(text) if _ is not None else text)
     ROOT.update()
 
 
@@ -1230,6 +1234,13 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event,
                     detected = detect_one_face_fast(temp_frame)
                     cached_many_faces = None
                     if detected is not None:
+                        # Derive alignment kps from the 106 landmarks here too,
+                        # so detection frames and refresh frames use the SAME
+                        # landmark source — mixing detector-kps with landmark-
+                        # kps oscillates (small systematic offset between models).
+                        _det_lmk = getattr(detected, 'landmark_2d_106', None)
+                        if _det_lmk is not None and isinstance(_det_lmk, np.ndarray) and _det_lmk.shape[0] == 106:
+                            detected.kps = _det_lmk[[38, 88, 86, 52, 61]].astype(np.float32)
                         cached_target_face = detected
                         last_good_face = detected
                         last_face_time = time.time()
@@ -1240,16 +1251,22 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event,
                         cached_target_face = last_good_face
                     else:
                         cached_target_face = None
-            elif (cached_target_face is not None
-                  and (modules.globals.mouth_mask or modules.globals.eyes_mask)):
+            elif cached_target_face is not None:
                 # Between detection frames: refresh only the 106-pt landmarks
-                # on the CURRENT frame (tiny 192x192 model, ~1-2ms). The mouth
-                # cutout content is always taken from the current frame, so if
-                # the polygon position is stale by up to det_interval frames
-                # the cutout grabs a misaligned patch — visible as flicker/
-                # disturbance around the lips while speaking. This keeps the
-                # lip polygon tracking at full frame rate.
+                # on the CURRENT frame (tiny 192x192 model, ~1-2ms). Two jobs:
+                # 1. Mouth/eye mask polygons track the current lip position
+                #    (cutout content is always current-frame, so a stale
+                #    polygon grabs a misaligned patch — lip flicker).
+                # 2. The 5-pt alignment kps are re-derived from the fresh
+                #    landmarks, so the SWAP ITSELF follows head motion at
+                #    full frame rate instead of freezing at the last detected
+                #    position and jumping on the next detection frame.
                 refresh_landmarks(temp_frame, cached_target_face)
+                lmk = getattr(cached_target_face, 'landmark_2d_106', None)
+                if lmk is not None and isinstance(lmk, np.ndarray) and lmk.shape[0] == 106:
+                    # Standard 106→5 mapping (same as FaceFusion):
+                    # 38=left eye, 88=right eye, 86=nose tip, 52/61=mouth corners
+                    cached_target_face.kps = lmk[[38, 88, 86, 52, 61]].astype(np.float32)
 
             # Build face list for enhancers from cached detection
             _cached_faces = None
