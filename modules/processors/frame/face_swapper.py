@@ -27,7 +27,7 @@ THREAD_LOCK = threading.Lock()
 _ema_kps = None
 # Adaptive EMA bounds: heavy smoothing when the face is still (suppresses
 # detector jitter), nearly raw landmarks during fast motion (no lip-sync lag).
-_ema_alpha_min = 0.75  # higher floor = snappier lips/expression (less lag), slight jitter when still
+_ema_alpha_min = 0.90  # higher floor = snappier lips/expression (less lag), slight jitter when still
 _ema_alpha_max = 1.0
 _ema_motion_gain = 10.0  # how fast alpha ramps up with motion (relative to eye distance)
 _ema_last_time = 0.0
@@ -456,6 +456,7 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     if source_face is None or target_face is None:
         return temp_frame
     if not hasattr(source_face, 'normed_embedding') or source_face.normed_embedding is None:
+        update_status("Source face has no embedding, skipping swap for this frame.", NAME)
         return temp_frame
 
     # _fast_paste_back writes in-place on the GPU path.  Only copy when
@@ -923,6 +924,13 @@ def process_frames(
     Iterates through frames, applies the appropriate swapping logic based on globals,
     and saves the result back to the frame path. Handles multi-threading via caller.
     """
+    # Reset colour-match EMAs so stale stats from a prior job don't cause a
+    # visible colour flash on the first frames of this one.
+    _face_color_ema['mean'] = None
+    _face_color_ema['ratio'] = None
+    _mouth_color_ema['shift'] = None
+    _eyes_color_ema['shift'] = None
+
     # Determine which processing function to use based on map_faces global setting
     use_v2 = getattr(modules.globals, "map_faces", False)
     source_face = None # Initialize source_face
@@ -1035,6 +1043,13 @@ def process_image(source_path: str, target_path: str, output_path: str) -> None:
     global PREVIOUS_FRAME_RESULT
     PREVIOUS_FRAME_RESULT = None
     # ---
+
+    # Reset colour-match EMAs so stale stats from a prior job don't cause a
+    # visible colour flash on this image.
+    _face_color_ema['mean'] = None
+    _face_color_ema['ratio'] = None
+    _mouth_color_ema['shift'] = None
+    _eyes_color_ema['shift'] = None
 
     use_v2 = getattr(modules.globals, "map_faces", False)
 
@@ -1162,7 +1177,7 @@ def create_lower_mouth_mask(
         # Expand landmarks from center, with extra downward bias toward chin
         offsets = lower_lip_landmarks - center
         # Add extra downward expansion for points below center (toward chin)
-        chin_bias = 1 + (mouth_mask_size / 100.0) * 1.5  # extra vertical stretch downward
+        chin_bias = 1 + (mouth_mask_size / 100.0) * 0.4  # extra vertical stretch downward (kept low to avoid pulling beard/jaw pixels into the mask)
         scale_y = np.where(offsets[:, 1] > 0, expansion_factor * chin_bias, expansion_factor)
         expanded_landmarks = lower_lip_landmarks.copy()
         expanded_landmarks[:, 0] = center[0] + offsets[:, 0] * expansion_factor
@@ -1697,8 +1712,11 @@ def create_face_mask(face: Face, frame: Frame) -> np.ndarray:
         try:
              hull = cv2.convexHull(face_outline.astype(np.float32)) # Use float for accuracy
              if hull is None or len(hull) < 3:
-                 # print("Warning: Convex hull calculation failed or returned too few points.")
-                 # Fallback: use bounding box of landmarks? Or just return empty mask?
+                 # Degenerate landmark input: fall back to a bounding rect so
+                 # callers (Poisson blend, masking) still get a non-empty mask
+                 # instead of a silent no-op.
+                 x, y, w, h = cv2.boundingRect(face_outline.astype(np.int32))
+                 cv2.rectangle(mask, (x, y), (x + w, y + h), 255, -1)
                  return mask
 
              # Draw the filled convex hull on the mask
